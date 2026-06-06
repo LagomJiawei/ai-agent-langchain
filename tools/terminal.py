@@ -1,12 +1,13 @@
 """
 终端命令执行工具
-注意：仅允许安全的白名单命令
+
+安全白名单（``TerminalSecurity``）被 ``harness.builtin_hooks.TerminalAllowlistHook``
+复用做 PreToolUse 拦截；工具体内不再做白名单校验。
 """
 import subprocess
 import shlex
 from loguru import logger
 from langchain_core.tools import tool
-from .rate_limiter import rate_limited
 
 
 class TerminalSecurity:
@@ -100,10 +101,10 @@ class TerminalSecurity:
 
 
 @tool
-@rate_limited("terminal_exec")
 def terminal_exec(command: str) -> str:
     """
-    执行终端命令（仅允许白名单内的安全命令）
+    执行终端命令。安全白名单由 Harness PreToolUse hook 上游强制校验，
+    此处假设输入命令已通过校验。
 
     Args:
         command: 要执行的终端命令
@@ -112,11 +113,6 @@ def terminal_exec(command: str) -> str:
         命令执行结果
     """
     logger.info(f"执行终端命令: {command}")
-
-    # 安全检查
-    is_safe, reason = TerminalSecurity.is_safe_command(command)
-    if not is_safe:
-        return f"安全检查失败: {reason}"
 
     try:
         result = subprocess.run(

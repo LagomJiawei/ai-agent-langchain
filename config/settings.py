@@ -2,9 +2,10 @@
 项目配置文件
 使用 Pydantic Settings 管理配置
 """
+import json
 from typing import Optional
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv()
@@ -56,7 +57,9 @@ class RagSettings(BaseSettings):
 class AgentSettings(BaseSettings):
     """Agent 配置"""
     max_iterations: int = Field(default=10, alias="AGENT_MAX_ITERATIONS")
-    mode: str = Field(default="auto", alias="AGENT_MODE")  # auto / react / plan_execute
+    context_max_tokens: int = Field(default=5734, alias="AGENT_CONTEXT_MAX_TOKENS")
+    trace_enabled: bool = Field(default=True, alias="AGENT_TRACE_ENABLED")
+    trace_dir: str = Field(default="./traces", alias="AGENT_TRACE_DIR")
 
 
 class ToolRateLimitSettings(BaseSettings):
@@ -72,6 +75,33 @@ class AppSettings(BaseSettings):
     host: str = Field(default="0.0.0.0", alias="APP_HOST")
     port: int = Field(default=8000, alias="APP_PORT")
     debug: bool = Field(default=True, alias="APP_DEBUG")
+
+
+class SecuritySettings(BaseSettings):
+    """身份与多租户隔离配置"""
+    api_keys: dict[str, str] = Field(default_factory=dict, alias="API_KEYS")
+    allow_anonymous: bool = Field(default=True, alias="ALLOW_ANONYMOUS")
+
+    @field_validator("api_keys", mode="before")
+    @classmethod
+    def _parse_api_keys(cls, value):
+        """env 中以 JSON 字符串形式提供，例如 '{"sk-xxx":"alice"}'。"""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"API_KEYS 必须是合法 JSON 字符串: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("API_KEYS 必须是对象 (JSON 映射)")
+            for k, v in parsed.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise ValueError("API_KEYS 的 key 与 value 都必须是字符串")
+            return parsed
+        raise ValueError(f"API_KEYS 类型不支持: {type(value)!r}")
 
 
 class Settings(BaseSettings):
@@ -91,6 +121,7 @@ class Settings(BaseSettings):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     tool_rate_limit: ToolRateLimitSettings = Field(default_factory=ToolRateLimitSettings)
     app: AppSettings = Field(default_factory=AppSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
     search_api_key: str = Field(default="", alias="SEARCH_API_KEY")
 
 

@@ -9,8 +9,14 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from config import settings
-from rag import RerankStrategy, get_document_reranker, get_document_retriever, transform_query_for_retrieval
-from .rate_limiter import rate_limited
+from rag import (
+    RerankStrategy,
+    calculate_quality_score,
+    get_document_reranker,
+    get_document_retriever,
+    judge_sufficiency,
+    transform_query_for_retrieval,
+)
 
 
 def _format_context(docs: List[Document]) -> str:
@@ -29,20 +35,7 @@ def _format_context(docs: List[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _calculate_quality_score(docs: List[Document]) -> float:
-    if not docs:
-        return 0.0
-
-    rerank_scores = [float(doc.metadata.get("rerank_score", doc.metadata.get("score", 0.0))) for doc in docs]
-    keyword_scores = [float(doc.metadata.get("keyword_score", 0.0)) for doc in docs]
-    avg_rerank_score = sum(rerank_scores) / len(rerank_scores)
-    best_keyword_score = max(keyword_scores) if keyword_scores else 0.0
-    count_score = min(len(docs) / settings.rag.top_k, 1.0)
-    return round(min(avg_rerank_score * 0.65 + best_keyword_score * 0.2 + count_score * 0.15, 1.0), 3)
-
-
 @tool
-@rate_limited("knowledge_base_search")
 def search_knowledge_base(query: str) -> str:
     """
     搜索本地理财知识库，获取与用户问题相关的参考资料。
@@ -64,8 +57,8 @@ def search_knowledge_base(query: str) -> str:
     reranked_docs = reranker.rerank(docs, rewritten_query, RerankStrategy.HYBRID_SCORE)
     final_docs = reranked_docs[: settings.rag.top_k]
 
-    quality_score = _calculate_quality_score(final_docs)
-    sufficiency = "adequate" if final_docs and quality_score >= settings.rag.quality_threshold else "insufficient"
+    quality_score = calculate_quality_score(final_docs)
+    sufficiency = judge_sufficiency(final_docs, quality_score)
 
     return json.dumps(
         {

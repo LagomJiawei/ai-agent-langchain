@@ -36,5 +36,8 @@ chat-memory/
 # Vector Index
 vector-index/
 
+# Harness Trace
+traces/
+
 # Logs
 *.log

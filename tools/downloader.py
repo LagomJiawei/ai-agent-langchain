@@ -6,7 +6,6 @@ import requests
 from pathlib import Path
 from loguru import logger
 from langchain_core.tools import tool
-from .rate_limiter import rate_limited
 
 
 class DownloadSecurity:
@@ -75,7 +74,6 @@ class DownloadSecurity:
 
 
 @tool
-@rate_limited("download_file")
 def download_file(url: str, save_path: str = "./downloads") -> str:
     """
     从网络下载文件

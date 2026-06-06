@@ -5,11 +5,9 @@ import requests
 from bs4 import BeautifulSoup
 from loguru import logger
 from langchain_core.tools import tool
-from .rate_limiter import rate_limited
 
 
 @tool
-@rate_limited("web_scraper")
 def scrape_web_page(url: str, max_length: int = 3000) -> str:
     """
     抓取指定 URL 的网页内容

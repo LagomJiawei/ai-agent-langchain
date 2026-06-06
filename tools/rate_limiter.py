@@ -1,11 +1,13 @@
 """
 工具限流保护模块
 令牌桶 QPS 限制 + 并发控制 + 熔断器
+
+注意：装饰器 ``rate_limited`` 已移除。限流逻辑由 Harness 的
+``RateLimitPreHook`` / ``RateLimitPostHook`` 通过 ``RateLimiter`` 实例统一接管。
 """
 import time
 import threading
 from typing import Callable, Any, Dict
-from functools import wraps
 from collections import deque
 from loguru import logger
 
@@ -196,26 +198,3 @@ def get_rate_limiter() -> RateLimiter:
             circuit_breaker_threshold=settings.tool_rate_limit.circuit_breaker_threshold,
         )
     return _global_rate_limiter
-
-
-def rate_limited(tool_name: str = None):
-    """限流装饰器"""
-
-    def decorator(func: Callable) -> Callable:
-        nonlocal tool_name
-        if tool_name is None:
-            tool_name = func.__name__
-
-        @wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            from config.settings import settings
-
-            if not settings.tool_rate_limit.enabled:
-                return func(*args, **kwargs)
-
-            limiter = get_rate_limiter()
-            return limiter.execute(tool_name, func, *args, **kwargs)
-
-        return wrapper
-
-    return decorator

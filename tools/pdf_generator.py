@@ -17,11 +17,9 @@ from reportlab.platypus import (
 )
 from loguru import logger
 from langchain_core.tools import tool
-from .rate_limiter import rate_limited
 
 
 @tool
-@rate_limited("generate_pdf")
 def generate_pdf(content: str, title: str = "Report", filename: str = None) -> str:
     """
     生成 PDF 报告文件

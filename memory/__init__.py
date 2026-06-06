@@ -1,16 +1,16 @@
-"""
-聊天记忆系统
+"""聊天记忆系统
 支持多种存储后端：内存、文件、Redis
 """
-from typing import Optional, List
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_classic.memory import ConversationBufferWindowMemory
+from typing import List
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
+from config.settings import settings
 
 from .base import BaseChatMemoryStore
-from .memory_store import InMemoryChatMemoryStore
 from .file_store import FileChatMemoryStore
+from .memory_store import InMemoryChatMemoryStore
 from .redis_store import RedisChatMemoryStore
-from config.settings import settings
 
 
 class ChatMemory:
@@ -23,25 +23,19 @@ class ChatMemory:
 
     @property
     def messages(self) -> List[BaseMessage]:
-        """获取所有消息"""
         return self._messages
 
     def add_user_message(self, message: str) -> None:
-        """添加用户消息"""
         self._messages.append(HumanMessage(content=message))
-        # 保持窗口大小
         if len(self._messages) > self.k * 2:
             self._messages = self._messages[-self.k * 2 :]
 
     def add_ai_message(self, message: str) -> None:
-        """添加 AI 消息"""
         self._messages.append(AIMessage(content=message))
-        # 保持窗口大小
         if len(self._messages) > self.k * 2:
             self._messages = self._messages[-self.k * 2 :]
 
     def clear(self) -> None:
-        """清空记忆"""
         self._messages = []
 
     def __len__(self) -> int:
@@ -54,9 +48,9 @@ def create_memory_store() -> BaseChatMemoryStore:
 
     if store_type == "memory":
         return InMemoryChatMemoryStore()
-    elif store_type == "file":
+    if store_type == "file":
         return FileChatMemoryStore(base_dir=settings.chat_memory.base_dir)
-    elif store_type == "redis":
+    if store_type == "redis":
         if not settings.redis.enabled:
             raise ValueError("Redis is not enabled in settings")
         return RedisChatMemoryStore(
@@ -65,27 +59,24 @@ def create_memory_store() -> BaseChatMemoryStore:
             db=settings.redis.db,
             password=settings.redis.password,
         )
-    else:
-        raise ValueError(f"Unknown memory store type: {store_type}")
+    raise ValueError(f"Unknown memory store type: {store_type}")
 
 
-def create_chat_memory(
-    conversation_id: str,
-    store: Optional[BaseChatMemoryStore] = None,
-    max_messages: Optional[int] = None,
-) -> ConversationBufferWindowMemory:
-    """创建带消息窗口的聊天记忆"""
-    if store is None:
-        store = create_memory_store()
+_memory_store_singleton: BaseChatMemoryStore | None = None
 
-    if max_messages is None:
-        max_messages = settings.chat_memory.max_messages
 
-    return ConversationBufferWindowMemory(
-        k=max_messages,
-        memory_key="chat_history",
-        return_messages=True,
-    )
+def get_memory_store() -> BaseChatMemoryStore:
+    """按 CHAT_MEMORY_STORE_TYPE 配置 lazy 构造单例 store。"""
+    global _memory_store_singleton
+    if _memory_store_singleton is None:
+        _memory_store_singleton = create_memory_store()
+    return _memory_store_singleton
+
+
+def reset_memory_store() -> None:
+    """仅供测试：清掉单例，下次 get 重新构造。"""
+    global _memory_store_singleton
+    _memory_store_singleton = None
 
 
 __all__ = [
@@ -94,6 +85,7 @@ __all__ = [
     "FileChatMemoryStore",
     "RedisChatMemoryStore",
     "create_memory_store",
-    "create_chat_memory",
+    "get_memory_store",
+    "reset_memory_store",
     "ChatMemory",
 ]

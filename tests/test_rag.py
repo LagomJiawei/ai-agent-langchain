@@ -367,6 +367,34 @@ def test_rag_pipeline_execute_chinese_uses_rewritten_query_without_translation()
             reranker.rerank.assert_called_once_with([], "基金定投 定期定额投资", RerankStrategy.HYBRID_SCORE)
 
 
+# ============================================================================
+# P8: 质量函数公开 API
+# ============================================================================
+
+
+def test_calculate_quality_score_and_judge_sufficiency_are_public():
+    """从 rag 顶层 import 即可使用，rag_tool 与 pipeline 共用同一份实现。"""
+    from langchain_core.documents import Document
+
+    from rag import calculate_quality_score, judge_sufficiency
+
+    empty_score = calculate_quality_score([])
+    assert empty_score == 0.0
+    assert judge_sufficiency([], empty_score) == "insufficient"
+
+    docs = [
+        Document(
+            page_content="x",
+            metadata={"rerank_score": 0.9, "keyword_score": 0.8},
+        )
+        for _ in range(3)
+    ]
+    score = calculate_quality_score(docs)
+    assert 0.0 < score <= 1.0
+    # adequate 与否取决于配置的 threshold；只验证两种取值之一
+    assert judge_sufficiency(docs, score) in ("adequate", "insufficient")
+
+
 if __name__ == "__main__":
     print("测试 RAG 组件初始化...")
     test_translation_transformer_initialization()

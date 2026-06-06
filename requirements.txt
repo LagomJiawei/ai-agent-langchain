@@ -3,8 +3,6 @@ langchain>=1.3,<1.4
 langchain-core>=1.4,<1.5
 langchain-openai>=1.2,<1.3
 langchain-community>=0.4,<0.5
-langchain-classic>=1.0,<1.1
-langgraph>=1.2,<1.3
 
 # 向量数据库
 langchain-milvus>=0.3,<0.4
@@ -41,6 +39,9 @@ loguru>=0.7,<0.8
 
 # PDF 生成
 reportlab>=4.5,<5.0
+
+# Token 计数（Harness context 预算估算）
+tiktoken>=0.13,<0.14
 
 # 测试
 pytest>=8.2,<9.0

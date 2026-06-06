@@ -6,14 +6,12 @@ import json
 import requests
 from loguru import logger
 from langchain_core.tools import tool
-from .rate_limiter import rate_limited
 
 # SearchAPI 的搜索接口地址
 SEARCH_API_URL = "https://www.searchapi.io/api/v1/search"
 
 
 @tool
-@rate_limited("web_search")
 def search_web(query: str, api_key: str = "") -> str:
     """
     搜索网络获取最新信息（使用百度搜索引擎）

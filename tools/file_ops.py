@@ -1,12 +1,14 @@
 """
 文件操作工具
 支持读取和写入文件
+
+路径白名单（``FileSecurity``）被 ``harness.builtin_hooks.FilePathAllowlistHook``
+复用做 PreToolUse 拦截；工具体内不再做路径校验。
 """
 import os
 from pathlib import Path
 from loguru import logger
 from langchain_core.tools import tool
-from .rate_limiter import rate_limited
 
 
 class FileSecurity:
@@ -53,10 +55,9 @@ class FileSecurity:
 
 
 @tool
-@rate_limited("file_read")
 def file_read(path: str) -> str:
     """
-    读取文件内容
+    读取文件内容（路径白名单由 Harness PreToolUse hook 上游强制校验）。
 
     Args:
         path: 文件路径（相对路径）
@@ -65,9 +66,6 @@ def file_read(path: str) -> str:
         文件内容
     """
     logger.info(f"读取文件: {path}")
-
-    if not FileSecurity.is_safe_path(path):
-        return f"错误: 不允许访问路径 {path}，请使用允许的目录: {FileSecurity.ALLOWED_DIRS}"
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -79,10 +77,9 @@ def file_read(path: str) -> str:
 
 
 @tool
-@rate_limited("file_write")
 def file_write(path: str, content: str) -> str:
     """
-    将内容写入文件
+    将内容写入文件（路径白名单由 Harness PreToolUse hook 上游强制校验）。
 
     Args:
         path: 文件路径（相对路径）
@@ -92,9 +89,6 @@ def file_write(path: str, content: str) -> str:
         操作结果
     """
     logger.info(f"写入文件: {path}")
-
-    if not FileSecurity.is_safe_path(path):
-        return f"错误: 不允许访问路径 {path}，请使用允许的目录: {FileSecurity.ALLOWED_DIRS}"
 
     try:
         FileSecurity.ensure_dir(path)
@@ -107,10 +101,9 @@ def file_write(path: str, content: str) -> str:
 
 
 @tool
-@rate_limited("file_list")
 def list_files(directory: str = "./") -> str:
     """
-    列出目录中的文件
+    列出目录中的文件（路径白名单由 Harness PreToolUse hook 上游强制校验）。
 
     Args:
         directory: 目录路径，默认当前目录
@@ -119,9 +112,6 @@ def list_files(directory: str = "./") -> str:
         文件列表
     """
     logger.info(f"列出目录: {directory}")
-
-    if not FileSecurity.is_safe_path(directory + "/dummy"):
-        return f"错误: 不允许访问目录 {directory}"
 
     try:
         path = Path(directory)
