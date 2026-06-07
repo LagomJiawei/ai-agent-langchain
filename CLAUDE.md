@@ -27,12 +27,20 @@
 - `app/main.py` 只暴露 FastAPI 应用对象 `app`，不维护重复的脚本启动逻辑。
 - 不新增平台专用启动脚本；需要平台差异时优先写入 README 或 PyCharm Run Configuration。
 
+## SSE 流式接口
+- 3 个 SSE 端点（`/api/chat/stream` / `/api/chat/agent/stream` / `/api/chat/rag/stream`）所有业务事件流必须通过 `app/sse.py::with_keepalive` 包装一层心跳，避免长任务下游 idle 导致浏览器 / Nginx（默认 60s）等代理断连。
+- 心跳格式是 SSE comment `: keepalive <unix_ts>\n\n`，符合 WHATWG SSE 规范，标准 `EventSource` 客户端自动忽略，对业务事件零侵入。
+- 心跳间隔由 `settings.app.sse_keepalive_interval`（env `SSE_KEEPALIVE_INTERVAL`）控制，默认 15s；设 ≤0 退化为透传上游。
+- 不在 Harness / RAG pipeline 层加心跳：心跳是传输层关注点，事件流上游不感知。要换 sse-starlette 等库时只动 `app/sse.py` 一处。
+
 ## Agent 实现
 - Agent 仅保留 `harness/` 单一主循环（think -> act -> observe）。不再维护 ReAct 与 Plan-and-Execute 两套并行实现，不再使用 LangGraph 编排。
 - 工具通过 `harness.register_tool` 注册到 `default_registry`；`tools/__init__.py` 在 import 时一次性注册全部工具。不再提供 `get_all_tools()`。
-- 主循环停止原因显式为四种：`final_text` / `terminate_tool` / `loop_guard` / `max_iterations`。循环防御阈值为相同 `(tool, args)` 累计 2 次。
+- 主循环停止原因显式为五种：`final_text` / `terminate_tool` / `loop_guard` / `max_iterations` / `error`（异常路径专用，正常路径走前四种）。循环防御阈值为相同 `(tool, args)` 累计 2 次。
 - 配置项只保留 `AGENT_MAX_ITERATIONS`，不再有 `AGENT_MODE` / `force_plan_execute`。
 - 工具横切关注点（限流、权限、循环防御、审计）通过 `harness/hooks.py` 的 hook 总线挂载：`PreToolUseHook` 返回 `ToolResult` 即拦截、返回 `None` 即放行；`PostToolUseHook` 链式改写结果；`OnStopHook` 用于审计落盘。工具体内不做安全校验、不使用装饰器。
+- Hook 既可写成 `def` 也可写成 `async def`。Harness 主循环走 `HookBus.arun_pre / arun_post / arun_stop`：async hook 原生 await，sync hook 自动 `asyncio.to_thread` 派到工作线程（避免 RateLimit 的 blocking semaphore acquire 冻结 event loop）。`HookBus.run_*` 同步入口保留给测试场景，生产路径不要直接调。
+- RateLimit hook 线程安全：`_inflight` 用 `dict` + `threading.Lock`，同一 `call.id` 重发幂等放行（不重复占 token / semaphore）；配套 `RateLimitSweeperStopHook` 在 OnStop 阶段兜底归还所有未配对释放的 semaphore，防主循环异常路径泄漏。
 - 新工具默认获得限流、循环防御保护；涉及文件系统、shell、网络写入等高危工具需要为其配套提供 PreToolUse permission hook，并在 `harness/builtin_hooks.py::default_hooks()` 中注册。
 - `Harness(hooks=...)` 显式传入空 `HookBus()` 可跑裸 loop（测试场景）；不传则使用 `default_hooks()` 装配。
 - `ConversationContext.snapshot()` 在估算 token 数超过 `AGENT_CONTEXT_MAX_TOKENS` 时原地裁剪：永远保留 SystemMessage、首条 HumanMessage、最近 2 个 AIMessage 及其紧跟的 ToolMessage；只裁中间的 ToolMessage（先截到 200 字符，仍超阈值则按从旧到新整条删）。AIMessage 永不裁，避免孤儿 tool_call_id。
@@ -41,13 +49,15 @@
 - 子 Harness 与主 Harness 共享全局 `RateLimiter` 单例（限流/熔断仍跨主子统一），但循环计数、context、trace 各自独立。
 - trace 通过 `parent_trace_id` 关联父子：主 Harness 在 `run()` 开始处把 `trace_id` 发布到 `harness.loop._current_trace_id_var` (`ContextVar`)；`dispatch_subagent` 工具读取该 var 作为子 Harness 的 `parent_trace_id`。事后可从 `./traces/` 按 `parent_trace_id` 拼调用树。
 - Harness 主循环对外暴露异步迭代器 `Harness.astream()`，同步 `Harness.run()` 内部委托给它（`asyncio.run`），单一事实源避免行为分裂。
-- LLM 通过 `llm_with_tools.astream()` 流式产出 token chunk；工具调用仍同步执行，由 `asyncio.to_thread` 在 event loop 里包装。Hook 同样保持同步。
+- LLM 通过 `llm_with_tools.astream()` 流式产出 token chunk；工具调用走 `tool.ainvoke`（async 工具原生 await，sync 工具由 LangChain 自动 `to_thread` 包装）。Hook 调用走 `HookBus.arun_*`（sync hook 自动 `asyncio.to_thread` 隔离）。
+- `Harness.__init__` 内的 `llm.bind_tools(tools)` 走进程级缓存：cache 挂在 llm 实例上的 `_harness_bind_cache` 属性，key 是 `frozenset(tool.name for tool in tools)`。同 llm + 同 scope 的子 Harness 复用同一个 `llm_with_tools` Runnable（实测 16 个 kb 子 Harness 从 ~40ms 降到 ~4ms）。llm 被 GC 时缓存跟着回收，无泄漏；测试桩没有 `bind_tools` 自动绕开。
 - 事件流类型固定 7 种：`run_start` / `thinking_token` / `tool_call` / `tool_result` / `final_text` / `run_end` / `error`，由 `harness/events.py` 工厂函数构造。
 - OnStop hook 在 `run_end` 事件**之前**触发，确保 trace 文件已落地后客户端才收到结束信号。
 - 子 agent (`dispatch_subagent`) 内部仍调同步 `Harness.run()`，子 agent 内部事件不暴露到主流；主流只见一次 `tool_call`/`tool_result`。
 - `chat()` 路径通过 `memory.get_memory_store()` 实现跨请求会话记忆（按 `CHAT_MEMORY_STORE_TYPE` 选 memory/file/redis）；`chat_with_agent` 与 RAG 路径不接 store（agent 是任务粒度，RAG 是字典式查询）。
 - `chat_id` 从 FastAPI 路由层传入到 `Harness(chat_id=...)`；Harness 主循环不消费它，只作审计标签 + trace 分桶维度；子 Harness 通过 `harness.loop.current_chat_id()` ContextVar 自动继承父 chat_id。
 - Trace 文件按 chat_id 落到 `AGENT_TRACE_DIR/<sanitized_chat_id or _default>/<trace_id>.json`；chat_id 含 `/`、`..` 等会被 `harness.trace._sanitize_chat_id` 替换为 `_`，防止写穿 base_dir。
+- Trace JSON 顶层 `schema_version` 字段标识 schema 版本，当前 = `harness.trace.TRACE_SCHEMA_VERSION = 1`。改动 schema（增删字段、改语义、改结构）时必须递增此常量，并在本文件以及该常量上方的版本注释里记录变更；离线分析脚本读取时按 `payload.get("schema_version", 0)` 兼容老 trace（v0 = 最初无版本号那批）。
 - `Harness.arun(query)` 是 async 公开入口；`Harness.run()` 是 `asyncio.run(self.arun(...))` 同步外壳。两路径单一事实源，外部并发场景请直接 `await sub.arun(...)`。
 - 多个独立子任务用 `dispatch_subagents(tasks, max_concurrency=4)` 并发派发；并发用 `asyncio.gather` + `asyncio.Semaphore`，硬上限 16 个任务、16 并发。子 agent 不能再调 `dispatch_subagent` / `dispatch_subagents`（由 `_build_sub_registry` 静态排除）。
 - 选择规则：单任务用具体工具；2+ 有依赖任务用多次 `dispatch_subagent` 顺序调用；2+ 独立任务用 `dispatch_subagents` 一次并发。
@@ -65,9 +75,9 @@
 - 查询变换统一使用 `transform_query_for_retrieval`：中文跳过翻译直接重写，非中文先翻译再基于翻译结果重写。
 - `document/*.md` 是默认内部知识库来源；本地 FAISS 持久化索引默认保存到 `./vector-index/faiss`，可用 `FAISS_PERSIST_DIR` 覆盖。
 - RAG 检索采用“候选召回 → rerank → top_k 截断 → sufficiency 判断”流程；不要在向量召回阶段使用固定相似度阈值硬过滤候选文档。
-- `RAG_RECALL_K` 控制候选召回数量，`RAG_TOP_K` 控制最终上下文数量，`RAG_QUALITY_THRESHOLD` 仅用于 Agentic RAG 的信息充足性判断。
+- `RAG_RECALL_K` 控制候选召回数量，`RAG_TOP_K` 控制最终上下文数量，`RAG_QUALITY_THRESHOLD` 仅用于 Agentic RAG 的信息充足性判断。`RAG_RETRIEVAL_CACHE_TTL` 控制 retrieval 缓存 TTL，默认 7 天（answer 缓存默认 24h）。
 - `vector-index/` 是生成产物目录，不进入版本管理；文档变更或解析策略变化后如需重建索引，先清理该目录或后续实现显式重建命令。
-- `RagPipeline.astream_execute(query)` 是异步事件流入口（5 类事件：`retrieval_started` / `retrieval_done` / `generation_token` / `done` / `error`）；同步 `RagPipeline.execute()` 保留并仍走缓存。流式路径**不走缓存**，每次完整跑 retrieval + generation。
+- `RagPipeline.astream_execute(query)` 是异步事件流入口（5 类事件：`retrieval_started` / `retrieval_done` / `generation_token` / `done` / `error`）；同步 `RagPipeline.execute()` 保留并仍走 answer 缓存。**两层缓存独立**：流式路径不写也不读 answer 缓存（保持 token 流体验），但读写 retrieval 缓存（命中时 `retrieval_done.from_cache=True`，跳过 retriever/reranker）；同步路径先 answer cache，未命中走 retrieval cache，生成后写两层。retrieval 缓存 key 用 `rewritten_query`（已规范化）。
 - `calculate_quality_score` / `judge_sufficiency` 是 `rag` 包公开 API，`rag_tool.py` 工具与流式 pipeline 共用同一份实现，避免漂移。
 
 ## 验证命令

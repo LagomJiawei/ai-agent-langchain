@@ -16,7 +16,7 @@ load_dotenv()
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  LiCaiManus - LangChain + LangGraph 版本")
+    print("  LiCaiManus - LangChain + Harness 主循环版本")
     print("=" * 60)
     print()
     print("启动服务...")

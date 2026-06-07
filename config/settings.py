@@ -52,6 +52,8 @@ class RagSettings(BaseSettings):
     top_k: int = Field(default=5, alias="RAG_TOP_K")
     recall_k: int = Field(default=50, alias="RAG_RECALL_K")
     quality_threshold: float = Field(default=0.35, alias="RAG_QUALITY_THRESHOLD")
+    # retrieval 缓存默认 7 天（比 answer 缓存的 24h 长，因为文档不变 retrieval 就稳定）
+    retrieval_cache_ttl: int = Field(default=86400 * 7, alias="RAG_RETRIEVAL_CACHE_TTL")
 
 
 class AgentSettings(BaseSettings):
@@ -75,6 +77,8 @@ class AppSettings(BaseSettings):
     host: str = Field(default="0.0.0.0", alias="APP_HOST")
     port: int = Field(default=8000, alias="APP_PORT")
     debug: bool = Field(default=True, alias="APP_DEBUG")
+    # SSE keepalive 间隔（秒）。≤0 禁用心跳，退化为透传上游。默认 15s 抗 Nginx 60s idle timeout。
+    sse_keepalive_interval: float = Field(default=15.0, alias="SSE_KEEPALIVE_INTERVAL")
 
 
 class SecuritySettings(BaseSettings):

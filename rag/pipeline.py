@@ -12,11 +12,13 @@ from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 
 from config import create_chat_model, settings
+from harness._message_utils import extract_chunk_text
 
 from . import events as _events
 from .cache import RagResultSemanticCache, get_semantic_cache
 from .events import RagEvent
 from .reranker import DocumentReranker, RerankStrategy, get_document_reranker
+from .retrieval_cache import RetrievalCache, RetrievalCacheEntry, get_retrieval_cache
 from .retriever import DocumentRetriever, get_document_retriever
 from .transformer import transform_query_for_retrieval
 
@@ -63,24 +65,6 @@ def judge_sufficiency(
     return "insufficient"
 
 
-def _extract_chunk_text(chunk) -> str:
-    """从 AIMessageChunk 提取增量文本（与 harness/loop.py 同形，故意不跨包复用）。"""
-    content = getattr(chunk, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                txt = part.get("text") or part.get("content")
-                if txt:
-                    parts.append(str(txt))
-            else:
-                parts.append(str(part))
-        return "".join(parts)
-    return ""
-
-
 class RagPipeline:
     """串行 RAG 流水线"""
 
@@ -89,10 +73,15 @@ class RagPipeline:
         retriever: Optional[DocumentRetriever] = None,
         reranker: Optional[DocumentReranker] = None,
         cache: Optional[RagResultSemanticCache] = None,
+        retrieval_cache: Optional[RetrievalCache] = None,
     ):
         self.retriever = retriever or get_document_retriever()
         self.reranker = reranker or get_document_reranker()
         self.cache = cache or get_semantic_cache()
+        # retrieval cache 与 answer cache 独立：流式 / 同步路径都用
+        self.retrieval_cache = (
+            retrieval_cache if retrieval_cache is not None else get_retrieval_cache()
+        )
         self.llm = create_chat_model(temperature=0.7)
 
         self.generation_prompt = ChatPromptTemplate.from_messages(
@@ -122,6 +111,56 @@ class RagPipeline:
 
         self.generation_chain = self.generation_prompt | self.llm
 
+    # ------------------------------------------------------------------
+    # retrieval（含缓存）—— execute / astream_execute / execute_with_steps 复用
+    # ------------------------------------------------------------------
+
+    def _run_retrieval(
+        self,
+        rewritten_query: str,
+        *,
+        enable_bilingual_fallback: bool = False,
+        rerank_strategy: RerankStrategy = RerankStrategy.HYBRID_SCORE,
+        use_cache: bool = True,
+    ) -> tuple[RetrievalCacheEntry, bool]:
+        """执行检索 + 重排，带 retrieval-level 缓存。
+
+        Returns:
+            (entry, from_cache)：``entry`` 是 ``RetrievalCacheEntry``；
+            ``from_cache=True`` 表示命中缓存，调用方可据此设置事件标记。
+        """
+        if use_cache and self.retrieval_cache is not None:
+            cached = self.retrieval_cache.get(rewritten_query)
+            if cached is not None:
+                logger.info(
+                    f"retrieval cache 命中: {rewritten_query[:50]}... "
+                    f"({len(cached.docs)} docs, quality={cached.quality_score})"
+                )
+                return cached, True
+
+        docs = self.retriever.retrieve(rewritten_query, enable_bilingual_fallback)
+        reranked = self.reranker.rerank(docs, rewritten_query, rerank_strategy)
+        final_docs = reranked[: settings.rag.top_k]
+        quality = calculate_quality_score(final_docs)
+        sufficiency = judge_sufficiency(final_docs, quality)
+        titles = [(doc.metadata.get("title") or "")[:80] for doc in final_docs]
+
+        entry = RetrievalCacheEntry(
+            docs=final_docs,
+            quality_score=quality,
+            sufficiency=sufficiency,
+            titles=titles,
+        )
+
+        if use_cache and self.retrieval_cache is not None:
+            self.retrieval_cache.put(rewritten_query, entry)
+
+        return entry, False
+
+    # ------------------------------------------------------------------
+    # 公开入口
+    # ------------------------------------------------------------------
+
     def execute(
         self,
         query: str,
@@ -142,38 +181,38 @@ class RagPipeline:
         start_time = time.time()
         logger.info(f"开始 RAG 流程: {query}")
 
-        # 1. 缓存检查
+        # 1. answer 缓存检查（最优先，命中直接返回）
         if self.cache:
             cached = self.cache.get(query)
             if cached:
-                logger.info(f"缓存命中，总耗时: {(time.time() - start_time) * 1000:.0f}ms")
+                logger.info(f"answer 缓存命中，总耗时: {(time.time() - start_time) * 1000:.0f}ms")
                 return cached
 
         # 2. 查询变换
         transform_result = transform_query_for_retrieval(query)
         rewritten = transform_result.rewritten_query
 
-        # 3. 文档检索
-        docs = self.retriever.retrieve(rewritten, enable_bilingual_fallback)
+        # 3. 检索 + 重排（走 retrieval 缓存）
+        entry, from_cache = self._run_retrieval(
+            rewritten,
+            enable_bilingual_fallback=enable_bilingual_fallback,
+            rerank_strategy=rerank_strategy,
+        )
+        final_docs = entry.docs
 
-        # 5. 重排序
-        reranked_docs = self.reranker.rerank(docs, rewritten, rerank_strategy)
-        final_docs = reranked_docs[: settings.rag.top_k]
-
-        # 6. 格式化上下文
+        # 4. 格式化上下文 + 生成答案
         context = self._format_context(final_docs)
-
-        # 7. 生成答案
         answer = self.generation_chain.invoke({"context": context, "query": query})
         final_answer = answer.content
 
-        # 8. 写入缓存
+        # 5. 写入 answer 缓存
         if self.cache:
             self.cache.put(query, final_answer)
 
         elapsed = (time.time() - start_time) * 1000
         logger.info(
-            f"RAG 流程完成，总耗时: {elapsed:.0f}ms，候选命中: {len(docs)} 条，上下文: {len(final_docs)} 条"
+            f"RAG 流程完成，总耗时: {elapsed:.0f}ms，上下文: {len(final_docs)} 条"
+            f"，retrieval_cache={'hit' if from_cache else 'miss'}"
         )
 
         return final_answer
@@ -184,7 +223,9 @@ class RagPipeline:
         """流式执行：发出阶段事件 + 生成 token。
 
         与 ``execute`` 的区别：
-        - **不走缓存**：流式语义下用户期望看到检索 + 生成全过程。
+        - **不走 answer 缓存**：流式语义下用户期望看到生成全过程（吐 token）。
+        - **走 retrieval 缓存**：retrieval + rerank 是稳定且最贵的部分，
+          命中时 ``retrieval_done.from_cache=True``，token 流仍正常发。
         - 检索 / 重排同步实现走 ``asyncio.to_thread``，避免阻塞 event loop。
         - 生成阶段用 ``generation_chain.astream`` 拿原生 token chunk。
         """
@@ -198,28 +239,24 @@ class RagPipeline:
                 original_query=query, rewritten_query=rewritten
             )
 
-            docs = await asyncio.to_thread(self.retriever.retrieve, rewritten)
-            reranked = await asyncio.to_thread(
-                self.reranker.rerank, docs, rewritten, RerankStrategy.HYBRID_SCORE
+            entry, from_cache = await asyncio.to_thread(
+                self._run_retrieval, rewritten
             )
-            final_docs = reranked[: settings.rag.top_k]
-            quality = calculate_quality_score(final_docs)
-            sufficiency = judge_sufficiency(final_docs, quality)
-            titles = [
-                (doc.metadata.get("title") or "")[:80] for doc in final_docs
-            ]
+            final_docs = entry.docs
+
             yield _events.retrieval_done(
                 doc_count=len(final_docs),
-                quality_score=quality,
-                sufficiency=sufficiency,
-                titles=titles,
+                quality_score=entry.quality_score,
+                sufficiency=entry.sufficiency,
+                titles=entry.titles,
+                from_cache=from_cache,
             )
 
             context = self._format_context(final_docs)
             async for chunk in self.generation_chain.astream(
                 {"context": context, "query": query}
             ):
-                delta = _extract_chunk_text(chunk)
+                delta = extract_chunk_text(chunk)
                 if delta:
                     yield _events.generation_token(delta)
 
@@ -240,11 +277,9 @@ class RagPipeline:
         result.translated_query = transform_result.translated_query
         result.rewritten_query = transform_result.rewritten_query
 
-        # 检索
-        docs = self.retriever.retrieve(result.rewritten_query)
-        result.retrieved_docs = self.reranker.rerank(
-            docs, result.rewritten_query, RerankStrategy.HYBRID_SCORE
-        )[: settings.rag.top_k]
+        # 检索（走 retrieval 缓存）
+        entry, _ = self._run_retrieval(result.rewritten_query)
+        result.retrieved_docs = entry.docs
 
         # 生成
         context = self._format_context(result.retrieved_docs)

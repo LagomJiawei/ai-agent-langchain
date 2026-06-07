@@ -22,6 +22,12 @@ from .pipeline import (
     judge_sufficiency,
 )
 from .cache import RagResultSemanticCache, get_semantic_cache
+from .retrieval_cache import (
+    RetrievalCache,
+    RetrievalCacheEntry,
+    get_retrieval_cache,
+    reset_retrieval_cache,
+)
 
 __all__ = [
     "QueryTranslationTransformer",
@@ -45,4 +51,8 @@ __all__ = [
     "get_rag_pipeline",
     "RagResultSemanticCache",
     "get_semantic_cache",
+    "RetrievalCache",
+    "RetrievalCacheEntry",
+    "get_retrieval_cache",
+    "reset_retrieval_cache",
 ]

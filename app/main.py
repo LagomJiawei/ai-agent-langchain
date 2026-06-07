@@ -16,6 +16,7 @@ from loguru import logger
 from config import settings
 from .security import Principal, resolve_principal
 from .services import get_financial_service
+from .sse import with_keepalive
 
 
 # 请求/响应模型
@@ -79,7 +80,7 @@ async def lifespan(app: FastAPI):
 # 创建 FastAPI 应用
 app = FastAPI(
     title="LiCaiManus API",
-    description="基于 LangChain + LangGraph 的智能化理财顾问服务",
+    description="基于 LangChain + 自研 Harness 主循环的智能化理财顾问服务",
     version="1.0.0",
     lifespan=lifespan,
     docs_url=None,
@@ -223,7 +224,7 @@ async def stream_chat(
 
     effective_chat_id = principal.namespace_chat_id(chat_id)
 
-    async def generate_response() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         try:
             service = get_financial_service()
             async for token in service.astream_chat(message, effective_chat_id):
@@ -232,6 +233,12 @@ async def stream_chat(
             yield "event: end\ndata: {}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"event: error\ndata: {json.dumps({'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    async def generate_response() -> AsyncGenerator[str, None]:
+        async for chunk in with_keepalive(
+            _inner(), interval=settings.app.sse_keepalive_interval
+        ):
+            yield chunk
 
     return StreamingResponse(
         generate_response(),
@@ -263,7 +270,7 @@ async def stream_chat_with_agent(
 
     effective_chat_id = principal.namespace_chat_id(chat_id)
 
-    async def generate_events() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         try:
             service = get_financial_service()
             async for event in service.astream_agent(message, chat_id=effective_chat_id):
@@ -277,6 +284,12 @@ async def stream_chat_with_agent(
                 "event: error\n"
                 f"data: {json.dumps({'message': str(e)}, ensure_ascii=False)}\n\n"
             )
+
+    async def generate_events() -> AsyncGenerator[str, None]:
+        async for chunk in with_keepalive(
+            _inner(), interval=settings.app.sse_keepalive_interval
+        ):
+            yield chunk
 
     return StreamingResponse(
         generate_events(),
@@ -308,7 +321,7 @@ async def stream_chat_with_rag(
 
     effective_chat_id = principal.namespace_chat_id(chat_id)
 
-    async def generate_events() -> AsyncGenerator[str, None]:
+    async def _inner() -> AsyncGenerator[str, None]:
         try:
             service = get_financial_service()
             async for event in service.astream_rag(message, chat_id=effective_chat_id):
@@ -322,6 +335,12 @@ async def stream_chat_with_rag(
                 "event: error\n"
                 f"data: {json.dumps({'message': str(e)}, ensure_ascii=False)}\n\n"
             )
+
+    async def generate_events() -> AsyncGenerator[str, None]:
+        async for chunk in with_keepalive(
+            _inner(), interval=settings.app.sse_keepalive_interval
+        ):
+            yield chunk
 
     return StreamingResponse(
         generate_events(),
