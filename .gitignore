@@ -41,3 +41,6 @@ traces/
 
 # Logs
 *.log
+
+# CLAUDE.md
+CLAUDE.md

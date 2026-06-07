@@ -2,22 +2,24 @@
 
 LiCaiManus 是一个基于 **FastAPI + LangChain + 自研 Harness** 的理财顾问 Agent 项目。它提供普通对话、RAG 知识库问答、Agent 工具调用、SSE 流式响应、FAISS 本地向量索引、可选 Redis 缓存与多后端会话记忆封装。
 
-项目当前更适合作为「AI Agent 后端应用样板」：代码已经覆盖 API 层、LLM 工厂、RAG pipeline、Agent 执行器、工具系统、测试用例和本地启动脚本，但部分能力仍是框架级封装，尚未完全接入主业务链路。
+代码覆盖 API 层、LLM 工厂、RAG pipeline、Agent 执行器、工具系统、Hook 总线、身份与多租户隔离、SSE 心跳、两层 RAG 缓存、多后端会话记忆，可直接作为 AI Agent 后端应用模板使用。当前测试 **219 passed**。
 
 ## 核心能力
 
 | 能力 | 当前状态 | 说明 |
 |---|---:|---|
 | 普通理财对话 | 已接入 | `/api/chat` 调用 LLM，以中文理财顾问身份回答 |
-| 会话记忆 | 部分接入 | 普通对话使用轻量内存窗口；文件/Redis 存储后端已实现，但主链路未持久化使用 |
+| 会话记忆 | 已接入 | 普通对话按 `CHAT_MEMORY_STORE_TYPE` 使用 memory/file/redis store 跨请求保存；RAG 与 Agent 路径不接会话记忆 |
 | RAG 问答 | 已接入 | `/api/chat/rag` 基于 `document/*.md` 构建本地知识库问答 |
 | Agent 任务 | 已接入 | `/api/chat/agent` 由项目自研 Harness 主循环驱动（think -> act -> observe） |
 | Agentic RAG 工具 | 已接入 | Agent 可调用 `search_knowledge_base` 检索本地理财知识库 |
-| SSE 流式响应 | 已接入 | `/api/chat/stream` 返回 SSE；当前是取完整答案后逐字输出，不是真正 LLM token streaming |
+| SSE 流式响应 | 已接入 | `/api/chat/stream`、`/api/chat/agent/stream`、`/api/chat/rag/stream` 三个端点全部内置 keepalive 心跳（默认 15s） |
 | FAISS 本地索引 | 已接入 | 默认使用 `./vector-index/faiss` 持久化索引 |
 | Milvus | 可配置 | 代码支持 `VECTOR_STORE_TYPE=milvus`，需要外部 Milvus 服务 |
-| Redis 语义缓存 | 可选 | `REDIS_ENABLED=true` 时启用 RAG 结果缓存 |
-| 工具限流 | 已接入 | 工具调用支持 QPS、并发和熔断保护 |
+| Redis 两层缓存 | 可选 | `REDIS_ENABLED=true` 时启用：answer 缓存（24h）+ retrieval 缓存（7d，流式路径也用） |
+| 工具限流 | 已接入 | QPS、并发、熔断三件套；hook 体系驱动，线程安全 + 重发幂等 |
+| 身份与多租户 | 已接入 | `X-API-Key` 头识别 principal，chat_id 自动命名空间隔离 |
+| Trace 落盘 | 已接入 | 每次 `Harness.run()` / `Harness.astream()` 写一份带 `schema_version` 的 JSON trace，按 `chat_id` 分桶 |
 
 ## 技术栈
 
@@ -37,13 +39,22 @@ LiCaiManus 是一个基于 **FastAPI + LangChain + 自研 Harness** 的理财顾
 ai-agent-langchain/
 ├── app/                    # FastAPI 应用层
 │   ├── main.py             # API 路由与 app 对象
-│   └── services.py         # FinancialAdvisorService 主服务编排
+│   ├── services.py         # FinancialAdvisorService 主服务编排
+│   ├── security.py         # 身份与多租户隔离（X-API-Key → Principal）
+│   └── sse.py              # SSE keepalive 心跳 helper
 ├── harness/                # Agent 执行框架
-│   ├── loop.py             # Harness 主循环：think -> act -> observe
-│   ├── registry.py         # ToolRegistry：按 scope 注册工具
-│   ├── context.py          # ConversationContext：消息上下文容器
+│   ├── loop.py             # Harness 主循环：think → act → observe
+│   ├── registry.py         # ToolRegistry：按 scope 注册 / 过滤工具
+│   ├── context.py          # ConversationContext：消息上下文 + token 预算裁剪
+│   ├── hooks.py            # HookBus：横切关注点（限流/权限/审计）
+│   ├── builtin_hooks.py    # 内置 hook 实现（RateLimit/LoopGuard/Allowlist/TraceWriter）
+│   ├── subagent.py         # dispatch_subagent / dispatch_subagents 并发派发
 │   ├── turn.py             # Turn / ToolCall / ToolResult 数据模型
-│   └── prompts/system.md   # 主 system prompt
+│   ├── trace.py            # HarnessTrace JSON 序列化（含 schema_version）
+│   ├── token_counter.py    # tiktoken 包装的 token 计数
+│   ├── _message_utils.py   # extract_chunk_text / extract_message_text 统一文本提取
+│   ├── events.py           # 事件工厂（run_start / thinking_token / …）
+│   └── prompts/            # 主 system prompt
 ├── config/                 # 配置、LLM 工厂、向量库工厂
 │   ├── settings.py
 │   ├── llm.py
@@ -52,8 +63,10 @@ ai-agent-langchain/
 │   ├── transformer.py      # 查询翻译/重写
 │   ├── retriever.py        # 候选召回与去重
 │   ├── reranker.py         # 重排序
-│   ├── pipeline.py         # 串行 RAG pipeline
-│   └── cache.py            # Redis RAG 结果缓存
+│   ├── pipeline.py         # 串行 RAG pipeline（同步 + 流式）
+│   ├── cache.py            # Redis RAG answer 缓存
+│   ├── retrieval_cache.py  # retrieval 级缓存（流式/同步共用）
+│   └── events.py           # RAG 事件工厂（RetrievalStarted / RagEvent / …）
 ├── tools/                  # Agent 工具集合
 │   ├── web_search.py
 │   ├── web_scraper.py
@@ -79,6 +92,7 @@ ai-agent-langchain/
 
 - `vector-index/`：FAISS 本地索引，已在 `.gitignore` 中忽略
 - `chat-memory/`：文件型会话记忆目录，已在 `.gitignore` 中忽略
+- `traces/`：Harness 执行 trace，按 `chat_id` 分桶，已在 `.gitignore` 中忽略
 - `venv/`、`.env`、`__pycache__/`：本地环境产物，不进入版本管理
 
 ## 架构流程
@@ -89,8 +103,8 @@ ai-agent-langchain/
 HTTP 请求
   -> app.main FastAPI route
   -> FinancialAdvisorService
-  -> LLM / RAG Pipeline / Agent Selector
-  -> 结构化响应
+  -> LLM / RAG Pipeline / Harness
+  -> 结构化响应或 SSE 事件流
 ```
 
 主要入口：
@@ -130,21 +144,32 @@ HTTP 请求
        act：从 ToolRegistry 取工具执行（被 hook 拦截则跳过真实执行）
        observe：PostToolUse hooks 改写结果 → 注入 ToolMessage 到上下文
   -> 循环防御 / 最大步数限制 / do_terminate
-  -> OnStop hooks → 最终答案（stopped_reason: final_text / terminate_tool / loop_guard / max_iterations）
+  -> OnStop hooks → 最终答案（stopped_reason: final_text / terminate_tool / loop_guard / max_iterations / error）
 ```
+
+`Harness` 同时暴露 `run()`（同步）/ `arun()`（async 公开入口）/ `astream()`（async 事件迭代器）三种调用方式，三者共享单一事实源（`run()` 内部委托 `arun()`，`arun()` 委托 `astream()`），外部并发场景请直接 `await sub.arun(...)`。
 
 ### Hook 系统
 
-横切关注点（限流、权限、循环防御、审计）由 `harness/hooks.py` 的 hook 总线统一处理，工具体内不做安全校验。默认装配的 PreToolUse 链：
+横切关注点（限流、权限、循环防御、审计）由 `harness/hooks.py` 的 hook 总线统一处理，工具体内不做安全校验。Hook 既支持 `def` 也支持 `async def` —— async hook 由 `HookBus.arun_pre / arun_post / arun_stop` 原生 `await`，sync hook 自动 `asyncio.to_thread` 派到工作线程，**不阻塞 event loop**（避免 RateLimit 的 blocking semaphore acquire 冻结主循环）。
+
+默认装配的 PreToolUse 链：
 
 | 顺序 | Hook | 职责 |
 |---|---|---|
-| 1 | `RateLimitPreHook` | 占令牌、查熔断；耗尽即拒绝 |
+| 1 | `RateLimitPreHook` | 占令牌、查熔断；耗尽即拒绝；线程安全 + 同 `call.id` 重发幂等 |
 | 2 | `TerminalAllowlistHook` | `terminal_exec` 的白名单校验 |
 | 3 | `FilePathAllowlistHook` | `file_read` / `file_write` / `list_files` 的路径白名单 |
 | 4 | `LoopGuardHook` | 相同 `(tool, args)` 累计 2 次拒绝并停止主循环 |
 
-PostToolUse 链当前仅 `RateLimitPostHook`，反馈结果给熔断器。OnStop 链当前为空，预留给 P3 审计落盘。
+PostToolUse 链：`RateLimitPostHook` 反馈结果给熔断器并归还信号量。
+
+OnStop 链：
+
+| 顺序 | Hook | 职责 |
+|---|---|---|
+| 1 | `RateLimitSweeperStopHook` | 异常路径兜底归还所有未配对释放的 semaphore，防泄漏 |
+| 2 | `TraceWriterHook` | 把 `HarnessTrace` 写入 `AGENT_TRACE_DIR/<chat_id>/<trace_id>.json` |
 
 测试可通过 `Harness(hooks=HookBus())` 绕过默认装配跑裸 loop。
 
@@ -170,6 +195,8 @@ PostToolUse 链当前仅 `RateLimitPostHook`，反馈结果给熔断器。OnStop
 
 ### 流式接口（SSE）
 
+三个 SSE 端点都内置 keepalive 心跳：流上游 idle 超过 `SSE_KEEPALIVE_INTERVAL`（默认 15s）时自动发出 SSE comment 行 `: keepalive <unix_ts>\n\n`，符合 WHATWG SSE 规范，标准 EventSource 客户端自动忽略。
+
 - `GET /api/chat/stream?message=...` —— 轻量对话真 token 流。每条 `data:` 是 `{"delta": "..."}`，最后 `event: end`。
 - `GET /api/chat/agent/stream?message=...&chat_id=default` —— Agent 事件流，事件类型固定 7 种：
 
@@ -179,9 +206,9 @@ PostToolUse 链当前仅 `RateLimitPostHook`，反馈结果给熔断器。OnStop
 | `thinking_token` | `turn_index` / `delta` | LLM 流式 token 增量 |
 | `tool_call` | `turn_index` / `call` | LLM 决定调用某工具 |
 | `tool_result` | `turn_index` / `result` | 工具返回（或 hook 拦截结果） |
-| `final_text` | `final_text` | 最终答案 |
-| `run_end` | `stopped_reason` / `total_tool_calls` / `finished_at` | 主循环结束 |
-| `error` | `message` | 异常信息（流已开则只能发 error 事件而非 HTTP 5xx） |
+| `final_text` | `final_text` | 最终答案（仅正常路径发，异常路径跳过） |
+| `run_end` | `stopped_reason` / `total_tool_calls` / `finished_at` | 主循环结束，`stopped_reason` ∈ `final_text` / `terminate_tool` / `loop_guard` / `max_iterations` / `error` |
+| `error` | `message` | 异常信息（异常路径事件序列：`error` → OnStop 写 trace → `run_end(stopped_reason="error")`，客户端仍能确定结束） |
 
 底层：`Harness.astream()` 是头等异步接口，`Harness.run()` 内部委托给它，保证两条路径行为完全一致。
 
@@ -190,12 +217,12 @@ PostToolUse 链当前仅 `RateLimitPostHook`，反馈结果给熔断器。OnStop
 | `event:` | `data:` 字段 | 说明 |
 |---|---|---|
 | `retrieval_started` | `original_query` / `rewritten_query` | 查询变换完成，开始检索 |
-| `retrieval_done` | `doc_count` / `quality_score` / `sufficiency` / `titles` | 检索 + 重排完成，含质量信号 |
+| `retrieval_done` | `doc_count` / `quality_score` / `sufficiency` / `titles` / `from_cache` | 检索 + 重排完成，含质量信号；`from_cache=true` 表示命中 retrieval 缓存 |
 | `generation_token` | `delta` | LLM 流式 token 增量 |
 | `done` | `finished_at` | 生成结束 |
 | `error` | `message` | 异常信息 |
 
-流式 RAG **不走缓存**（语义上用户希望看到检索 + 生成全过程）；同步 `/api/chat/rag` 仍走缓存。
+流式 RAG **不写 answer 缓存**（保持 token 流体验）但**读写 retrieval 缓存**（命中时 `retrieval_done.from_cache=true`，跳过 retriever + reranker，token 流仍正常发）；同步 `/api/chat/rag` 路径先 answer cache、未命中走 retrieval cache，生成后写两层。
 
 已注册工具：
 
@@ -287,8 +314,12 @@ CHAT_MEMORY_BASE_DIR=./chat-memory
 RAG_RECALL_K=50
 RAG_TOP_K=5
 RAG_QUALITY_THRESHOLD=0.35
+RAG_RETRIEVAL_CACHE_TTL=604800
 
 AGENT_MAX_ITERATIONS=10
+AGENT_CONTEXT_MAX_TOKENS=5734
+AGENT_TRACE_ENABLED=true
+AGENT_TRACE_DIR=./traces
 
 TOOL_RATE_LIMIT_ENABLED=true
 TOOL_RATE_LIMIT_QPS=5
@@ -298,6 +329,13 @@ TOOL_RATE_LIMIT_CIRCUIT_BREAKER_THRESHOLD=5
 APP_HOST=0.0.0.0
 APP_PORT=8000
 APP_DEBUG=true
+# 注意：当前 run.py 的 reload 开关读取 DEBUG，不读取 APP_DEBUG
+DEBUG=true
+SSE_KEEPALIVE_INTERVAL=15
+
+# 多租户（可选）：JSON 映射 {api_key: principal_id}
+# API_KEYS={"sk-alice":"alice","sk-bob":"bob"}
+ALLOW_ANONYMOUS=true
 ```
 
 ### 4. 验证环境
@@ -377,9 +415,9 @@ bash scripts/setup.sh
 | `POST` | `/api/chat/rag` | RAG 知识库增强对话（同步，走缓存） |
 | `POST` | `/api/chat/agent` | Agent 任务处理（同步）；``chat_id`` 用于 trace 分桶 |
 | `GET` | `/api/chat/stream` | 轻量对话真 token 流（SSE）；``?message=...&chat_id=...`` |
-| `GET` | `/api/chat/rag/stream` | RAG 流式问答（SSE）；``?message=...&chat_id=...``，不走缓存 |
-| `GET` | `/api/chat/agent/stream` | Agent 事件流（SSE，含工具调用过程）；``?message=...&chat_id=...`` |
-| `GET` | `/api/cache/stats` | RAG 缓存统计 |
+| `GET` | `/api/chat/rag/stream` | RAG 流式问答（SSE，含心跳）；不写 answer 缓存但读写 retrieval 缓存 |
+| `GET` | `/api/chat/agent/stream` | Agent 事件流（SSE，含工具调用过程 + 心跳）；``?message=...&chat_id=...`` |
+| `GET` | `/api/cache/stats` | RAG answer 缓存统计（不包含 retrieval 缓存数量） |
 | `DELETE` | `/api/memory/{chat_id}` | 清理指定会话记忆（从 ``memory/`` store 实际删除） |
 
 ## 请求示例
@@ -422,6 +460,78 @@ curl "http://localhost:8000/api/chat/stream?message=什么是指数基金&chat_i
 curl http://localhost:8000/api/cache/stats
 ```
 
+该接口统计的是 RAG answer 缓存；retrieval 缓存目前没有单独暴露统计 API。
+
+### RAG 流式问答
+
+```bash
+curl -N "http://localhost:8000/api/chat/rag/stream?message=什么是基金定投&chat_id=demo"
+```
+
+### Agent 事件流
+
+```bash
+curl -N "http://localhost:8000/api/chat/agent/stream?message=检索知识库并说明基金定投适合什么人&chat_id=demo"
+```
+
+### 清理会话记忆
+
+```bash
+curl -X DELETE http://localhost:8000/api/memory/demo
+```
+
+多租户示例：
+
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: sk-alice" \
+  -d '{"message":"继续刚才的话题","chat_id":"demo","use_memory":true}'
+```
+
+服务端实际使用的会话键是 `alice:demo`，响应中仍返回客户端传入的 `demo`。
+
+## 会话记忆
+
+普通 `/api/chat` 路径在 `use_memory=true` 时会读写会话记忆：
+
+```text
+路由层 chat_id
+  -> Principal.namespace_chat_id()
+  -> <principal>:<chat_id>
+  -> memory store
+  -> 最近 10 轮进入 LLM 上下文
+```
+
+可选后端：
+
+| `CHAT_MEMORY_STORE_TYPE` | 说明 |
+|---|---|
+| `memory` | 进程内临时存储，进程退出即丢失 |
+| `file` | 默认，写入 `CHAT_MEMORY_BASE_DIR`，适合本地开发 |
+| `redis` | 使用 Redis 保存，适合多进程 / 容器场景 |
+
+边界：
+
+- `/api/chat/stream` 是轻量 token 流，不读写会话记忆。
+- `/api/chat/rag` 与 `/api/chat/rag/stream` 不读写会话记忆；RAG 是基于知识库的字典式查询。
+- `/api/chat/agent` 与 `/api/chat/agent/stream` 不读写会话记忆；Agent 是任务粒度执行，`chat_id` 只用于审计和 trace 分桶。
+- `DELETE /api/memory/{chat_id}` 只清理当前 principal 命名空间下的会话。
+
+## Trace 与审计
+
+默认 `AGENT_TRACE_ENABLED=true`，每次 `Harness.run()` / `Harness.astream()` 都会在 OnStop 阶段写入 JSON trace：
+
+```text
+AGENT_TRACE_DIR/
+└── <sanitized_chat_id>/
+    └── <trace_id>.json
+```
+
+Trace 顶层包含 `schema_version`，当前版本由 `harness.trace.TRACE_SCHEMA_VERSION` 定义。改动 trace schema 时必须同步递增该常量和项目 `CLAUDE.md` 中的版本说明。
+
+主子 agent trace 通过 `parent_trace_id` 关联：主 Harness 开始时把当前 `trace_id` 发布到 `ContextVar`，`dispatch_subagent` / `dispatch_subagents` 创建的子 Harness 会继承并写入 `parent_trace_id`。
+
 ## 知识库维护
 
 默认知识库来源是：
@@ -453,10 +563,16 @@ A：回答内容
 - 重排器元数据保留
 - Markdown 知识库解析
 - FAISS 索引持久化与重载
-- Agent 初始化与模式选择
-- Harness 循环防御与停止原因（final_text / terminate_tool / loop_guard / max_iterations）
+- Agent 初始化与 Harness 主循环停止原因（final_text / terminate_tool / loop_guard / max_iterations / error）
+- Harness hook 总线、工具限流、白名单、循环防御与异常兜底释放
+- Harness async 入口、SSE 事件流、上下文 token 裁剪、LLM bind_tools 缓存
+- 子 agent 单任务 / 多任务派发、chat_id ContextVar 继承、trace 父子关联
+- 身份与多租户 chat_id 命名空间隔离
+- 普通对话跨请求会话记忆读写与清理
 - Agentic RAG 工具质量信号
 - RAG pipeline 在 rerank 后再按 `top_k` 截断
+- RAG 流式事件、retrieval 缓存、SSE keepalive 心跳
+- 消息 chunk 文本提取工具函数
 
 运行：
 
@@ -473,16 +589,26 @@ python -m pytest tests/ -v
 - Redis 相关能力使用官方 `redis` Python 客户端，不引入 `redis-py-cluster`。
 - 本地开发启动入口统一为 `python run.py`。
 - `app/main.py` 只暴露 FastAPI 应用对象，不维护重复启动逻辑。
+- Agent 只保留 `harness/` 单一主循环，不恢复 ReAct / Plan-and-Execute / LangGraph 并行实现。
+- 工具通过 `harness.register_tool` 注册到 `default_registry`；新增高危工具时要配套 permission hook 并在 `default_hooks()` 注册。
+- 工具体内不做横切安全校验；限流、权限、循环防御、审计统一通过 hook 总线实现。
+- 多个独立子任务用 `dispatch_subagents` 并发派发；有依赖关系的子任务用多次 `dispatch_subagent` 顺序执行。
 - RAG 只保留串行 `RagPipeline`，不引入并行 RAG pipeline 或并行 API 参数。
+- SSE 心跳只放在 `app/sse.py` 传输层，不下沉到 Harness 或 RAG pipeline。
 
 ## 当前实现边界
 
 这部分是接手项目时最容易误判的地方：
 
-1. `/api/chat/stream` 是模型原生 token 流，不是后处理的逐字回放。轻量对话，不接 RAG。
-2. `search_web` 需要 `SEARCH_API_KEY`，否则搜索工具不可用。
-3. `VECTOR_STORE_TYPE=milvus` 需要可用 Milvus 服务和匹配的向量维度配置。
-4. 首次 RAG 调用会构建 FAISS 索引，并调用 Embedding API，速度取决于文档量和模型服务。
+1. `/api/chat/stream` 是模型原生 token 流，不是后处理的逐字回放；它是轻量对话，不接 RAG，也不接跨请求记忆。
+2. `/api/chat/rag/stream` 不写 answer 缓存，但会读写 retrieval 缓存；同步 `/api/chat/rag` 会先查 answer 缓存，未命中再走 retrieval 缓存。
+3. `/api/chat/agent` 和 `/api/chat/agent/stream` 不接会话记忆；`chat_id` 用于审计标签和 trace 分桶。
+4. `search_web` 需要 `SEARCH_API_KEY`，否则搜索工具不可用。
+5. `VECTOR_STORE_TYPE=milvus` 需要可用 Milvus 服务；当前 `MILVUS_DIMENSION` 配置存在于 settings 中，但 `create_milvus_vector_store()` 未显式使用该字段，集合维度主要由 embedding 写入时决定。
+6. 首次 RAG 调用会构建 FAISS 索引，并调用 Embedding API，速度取决于文档量和模型服务。
+7. `vector-index/`、`chat-memory/`、`traces/` 都是运行产物目录，不应提交。
+8. `ALLOW_ANONYMOUS=true` 是向后兼容默认值；生产场景应配置 `API_KEYS` 并按需关闭匿名访问。
+9. Trace JSON 有 schema 版本，离线分析脚本读取时应按 `schema_version` 做兼容。
 
 ## License
 
